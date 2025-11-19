@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 
 import warp as wp
@@ -223,16 +225,19 @@ def apply_bounds(
     width: float,
     height: float,
     length: float,
+    moving_width: float,
 ):
     tid = wp.tid()
 
     x = particle_x[tid]
 
+    x_max = wp.min(width, moving_width)
+
     # box: [0, width] x [0, height] x [0, length]
     if x[0] < 0.0:
         x = wp.vec3f(0.0, x[1], x[2])
-    if x[0] > width:
-        x = wp.vec3f(width, x[1], x[2])
+    if x[0] > x_max:
+        x = wp.vec3f(x_max, x[1], x[2])
 
     if x[1] < 0.0:
         x = wp.vec3f(x[0], 0.0, x[2])
@@ -300,28 +305,28 @@ def update(
 @wp.kernel
 def initialize_particles(
     particle_x: wp.array(dtype=wp.vec3f),
-    smoothing_length: float,
-    width: float,
-    height: float,
-    length: float,
+    spacing: wp.vec3f,
+    offset: wp.vec3f,
+    count_x: int,
+    count_y: int,
+    count_z: int,
 ):
     tid = wp.tid()
 
-    # [0, width/4] x [0, height] x [0, length/4]
-    nr_x = wp.int32(width / (4.0 * smoothing_length))
-    nr_y = wp.int32(height / smoothing_length)
-    nr_z = wp.int32(length / (4.0 * smoothing_length))
+    total_particles = count_x * count_y * count_z
+    if tid >= total_particles:
+        return
 
-    z = wp.float(tid % nr_z)
-    y = wp.float((tid // nr_z) % nr_y)
-    x = wp.float((tid // (nr_z * nr_y)) % nr_x)
+    # x fastest, then z, then y (matches Taichi layout)
+    x_index = wp.float(tid % count_x)
+    yz = tid // count_x
+    z_index = wp.float(yz % count_z)
+    y_index = wp.float(yz // count_z)
 
-    pos = smoothing_length * wp.vec3f(x, y, z)
-
-    # jitter
-    state = wp.rand_init(123, tid)
-    pos = pos + 0.001 * smoothing_length * wp.vec3f(
-        wp.randn(state), wp.randn(state), wp.randn(state)
+    pos = wp.vec3f(
+        offset[0] + spacing[0] * x_index,
+        offset[1] + spacing[1] * y_index,
+        offset[2] + spacing[2] * z_index,
     )
 
     particle_x[tid] = pos
@@ -339,8 +344,8 @@ class Example:
         self.device = device or wp.get_preferred_device()
         self.renderer = wp.render.OpenGLRenderer("PBF")
 
-        self.smoothing_length = 0.10  # kernelRadius
-        self.rest_density = 8000.0
+        self.smoothing_length = 1.10  # match Taichi kernel radius
+        self.rest_density = 1.0
         self.damping = 0.98
         self.dt = 0.0083
 
@@ -348,17 +353,67 @@ class Example:
         self.gravity = wp.vec3f(0.0, -9.8, 0.0)
 
         # domain box
-        self.width = 5.0
-        self.height = 10.0
-        self.length = 5.0
+        self.width = 30.0
+        self.height = 15.0
+        self.length = 15.0
+
+        # Aim the Warp OpenGLRenderer camera toward the fluid block so the
+        # full domain is comfortably in frame (per renderer docs).
+        scene_center = np.array(
+            [self.width * 0.5, self.height * 0.5, self.length * 0.5],
+            dtype=np.float32,
+        )
+        camera_offset = np.array(
+            [0.0, self.height * 0.25, self.length * 1.75],
+            dtype=np.float32,
+        )
+        camera_pos = scene_center + camera_offset
+        camera_front = scene_center - camera_pos
+        norm = np.linalg.norm(camera_front)
+        if norm > 0.0:
+            camera_front /= norm
+
+        self.renderer.camera_pos = tuple(camera_pos.tolist())
+        self.renderer.camera_front = tuple(camera_front.tolist())
+        self.renderer.camera_up = (0.0, 1.0, 0.0)
+        self.renderer.update_view_matrix()
+
+        self.boundary_extent = self.width - 1.0e-3
+        self.boundary_phase = 0.0
+        self.boundary_period_steps = 90.0
+        self.boundary_reference_dt = 1.0 / 20.0
+        self.boundary_velocity_strength = 4.5
 
         # particle mass (simplified)
         self.particle_mass = 1.0
 
-        nr_x = int(self.width / (2.0 * self.smoothing_length))
-        nr_y = int(self.height / self.smoothing_length)
-        nr_z = int(self.length / (2.0 * self.smoothing_length))
-        self.n = nr_x * nr_y * nr_z
+        # Taichi scene block dimensions (30 x 10 x 15)
+        self.num_particles_x = 30
+        self.num_particles_y = 10
+        self.num_particles_z = 15
+        self.n = self.num_particles_x * self.num_particles_y * self.num_particles_z
+        offset_x = 0.0
+        offset_y = self.height * 0.1
+        offset_z = 0.0
+        self.particle_offset = wp.vec3f(offset_x, offset_y, offset_z)
+
+        desired_spacing = self.smoothing_length * 1.05
+
+        def compute_spacing(available: float, count: int):
+            if count <= 1:
+                return 0.0
+            effective_available = max(available, self.smoothing_length)
+            return min(desired_spacing, effective_available / (count - 1))
+
+        available_x = self.boundary_extent - offset_x - self.smoothing_length
+        available_y = self.height - offset_y - self.smoothing_length
+        available_z = self.length - offset_z - self.smoothing_length
+
+        spacing_x = compute_spacing(available_x, self.num_particles_x)
+        spacing_y = compute_spacing(available_y, self.num_particles_y)
+        spacing_z = compute_spacing(available_z, self.num_particles_z)
+
+        self.particle_spacing = wp.vec3f(spacing_x, spacing_y, spacing_z)
 
         # solver substeps per frame
         self.sim_step_to_frame_ratio = 4
@@ -380,10 +435,11 @@ class Example:
             dim=self.n,
             inputs=[
                 self.x,
-                self.smoothing_length,
-                self.width,
-                self.height,
-                self.length,
+                self.particle_spacing,
+                self.particle_offset,
+                self.num_particles_x,
+                self.num_particles_y,
+                self.num_particles_z,
             ],
             device=self.device,
         )
@@ -395,9 +451,23 @@ class Example:
         grid_res = max(grid_res, 8)
         self.grid = wp.HashGrid(grid_res, grid_res, grid_res, device=self.device)
 
+    def move_boundary(self):
+        step_increments = self.dt / self.boundary_reference_dt
+        self.boundary_phase += step_increments
+        if self.boundary_phase >= 2.0 * self.boundary_period_steps:
+            self.boundary_phase -= 2.0 * self.boundary_period_steps
+
+        sin_arg = (self.boundary_phase * math.pi) / self.boundary_period_steps
+        velocity = -math.sin(sin_arg) * self.boundary_velocity_strength
+        new_extent = self.boundary_extent + velocity * self.dt
+        min_extent = 2.0 * self.smoothing_length
+        max_extent = self.width - 1.0e-3
+        self.boundary_extent = float(np.clip(new_extent, min_extent, max_extent))
+
     def step(self):
         with wp.ScopedTimer("step", active=self.verbose):
             for _ in range(self.sim_step_to_frame_ratio):
+                self.move_boundary()
                 # save old positions for velocity update
                 wp.launch(
                     kernel=save_positions,
@@ -485,7 +555,13 @@ class Example:
                     wp.launch(
                         kernel=apply_bounds,
                         dim=self.n,
-                        inputs=[self.x, self.width, self.height, self.length],
+                        inputs=[
+                            self.x,
+                            self.width,
+                            self.height,
+                            self.length,
+                            self.boundary_extent,
+                        ],
                         device=self.device,
                     )
 
@@ -513,9 +589,6 @@ if __name__ == "__main__":
         "--device", type=str, default=None, help="Override the default Warp device."
     )
     parser.add_argument(
-        "--num_frames", type=int, default=4800, help="Total number of frames."
-    )
-    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Print out additional status messages during execution.",
@@ -526,6 +599,8 @@ if __name__ == "__main__":
     with wp.ScopedDevice(args.device or wp.get_preferred_device()):
         example = Example(verbose=args.verbose, device=args.device)
 
-        for _ in range(args.num_frames):
+        while example.renderer.is_running():
             example.render()
+            if not example.renderer.is_running():
+                break
             example.step()
