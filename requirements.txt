@@ -1,0 +1,4 @@
+warp-lang>=1.5.0
+numpy>=1.24
+pyglet>=2.0
+
